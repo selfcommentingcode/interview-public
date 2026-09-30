@@ -1,6 +1,72 @@
 # CRM API Server
 
-A simple CRM-style API server for managing contacts and files. Available in both Go and Java implementations with identical API interfaces.
+A compact, dual-language CRM API — the **same REST surface** implemented in both **Go** and **Java (Spring Boot)**, backed by SQLite. Manage contacts and files, export/report, and paginate through large datasets.
+
+![Java 17](https://img.shields.io/badge/Java-17-007396?logo=openjdk&logoColor=white)
+![Spring Boot 3.3](https://img.shields.io/badge/Spring%20Boot-3.3.0-6DB33F?logo=springboot&logoColor=white)
+![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
+![SQLite 3.46](https://img.shields.io/badge/SQLite-3.46-003B57?logo=sqlite&logoColor=white)
+![Rate limiter coverage 100%](https://img.shields.io/badge/rate--limiter%20coverage-100%25-brightgreen)
+
+Both implementations share the same SQLite database schema and provide identical REST API endpoints.
+
+---
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Documentation](#documentation)
+- [Implementations](#implementations)
+- [Quick Start](#quick-start)
+- [Authentication](#authentication)
+- [Rate Limiting](#rate-limiting)
+- [Endpoints](#endpoints)
+- [Pagination](#pagination)
+- [Examples](#examples)
+- [Testing](#testing)
+- [Seeding Options](#seeding-options)
+- [Benchmarks (Go only)](#benchmarks-go-only)
+- [Configuration](#configuration)
+
+---
+
+## Architecture
+
+Every request flows through a global rate limiter and bearer-token authentication before reaching a controller. Controllers persist through thin repositories to SQLite, while uploaded file bytes live on the local filesystem.
+
+```mermaid
+flowchart LR
+  Client([HTTP Client])
+
+  Client --> RL["Rate Limiter<br/>global · 10 req/min<br/>(Java)"]
+  RL --> Auth["Auth<br/>Bearer token = email"]
+  Auth --> Router["Router / Dispatcher"]
+
+  Router --> Contacts["Contacts API"]
+  Router --> Files["Files API"]
+  Router --> Reports["Reports API"]
+  Router --> Health["Health"]
+
+  Contacts --> Repo[("Repositories<br/>SQL via JDBC")]
+  Reports --> Repo
+  Files --> Repo
+  Repo --> DB[("SQLite<br/>data/app.db")]
+  Files --> FS[["Filesystem<br/>data/files/"]]
+```
+
+> The rate limiter is a **Java** feature (see [Rate Limiting](#rate-limiting)). For the full request lifecycle, startup sequence, and concurrency model — including the leaky-bucket internals — see the deep-dive docs below.
+
+## Documentation
+
+In-depth design docs for the Java implementation (each diagram renders on GitHub and has a rendered PNG under [`java/diagrams/`](java/diagrams/)):
+
+| Document | What's inside |
+|----------|---------------|
+| [`java/REQUEST_LIFECYCLE.md`](java/REQUEST_LIFECYCLE.md) | Request lifecycle, startup/background runners, and the concurrency model — **5 Mermaid diagrams** |
+| [`java/RATE_LIMITING.md`](java/RATE_LIMITING.md) | Leaky-bucket design notes: decisions, tradeoffs, alternatives considered, and future improvements |
+| [`java/TESTING.md`](java/TESTING.md) | End-to-end testing guide + a ready-to-run Postman collection |
+
+---
 
 ## Implementations
 
@@ -54,6 +120,24 @@ curl -H "Authorization: Bearer user@example.com" http://localhost:8080/api/conta
 ```
 
 The token should be a valid email address. It serves as the user identifier.
+
+## Rate Limiting
+
+The **Java** server applies a **global, process-local rate limit** using a leaky
+bucket algorithm: **10 requests per minute** shared across all clients (not
+per-user). Requests beyond the limit receive `429 Too Many Requests` with a JSON
+body:
+
+```json
+{"error":"rate limit exceeded"}
+```
+
+The limit is applied to every request before authentication, including `/health`.
+Tune it with `app.rate-limit.requests-per-minute` in `application.properties`.
+
+See [`java/RATE_LIMITING.md`](java/RATE_LIMITING.md) for design notes and
+tradeoffs, and [`java/REQUEST_LIFECYCLE.md`](java/REQUEST_LIFECYCLE.md) for where
+it fits in the request lifecycle (with rendered diagrams).
 
 ## Endpoints
 
@@ -136,6 +220,35 @@ curl -H "Authorization: Bearer user@example.com" \
   http://localhost:8080/api/contacts/export > contacts.csv
 ```
 
+## Testing
+
+**Unit tests** (JUnit 5) exercise the rate limiter — both the leaky-bucket algorithm and the
+servlet filter — at **100% line & branch coverage** (JaCoCo). No server needed:
+
+```bash
+cd java
+./mvnw test        # 8 tests; coverage report at target/site/jacoco/index.html
+```
+
+- `LeakyBucketRateLimiterTest` — admit-to-capacity, reject overflow, config-driven capacity,
+  steady leak, full recovery, idle clamping (deterministic via an injected clock — no sleeps).
+- `RateLimitFilterTest` — admitted requests pass through; rejected ones return `429` + JSON.
+
+A ready-to-run **Postman collection** lives in [`java/postman/`](java/postman/) — import
+`CRM-API.postman_collection.json` + `CRM-API.postman_environment.json`. It covers the full
+CRUD surface, a rate-limit burst (10×`200` then `429`), and the auth matrix (valid → `200`,
+missing/bad → `401`).
+
+See [`java/TESTING.md`](java/TESTING.md) for tight step-by-step instructions. Quick smoke
+test of the rate limiter (run on a fresh bucket):
+
+```bash
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w "#$i -> %{http_code}\n" http://localhost:8080/health
+done
+# → ten 200s, then 429
+```
+
 ## Seeding Options
 
 ### Go
@@ -190,3 +303,4 @@ Configuration is in `src/main/resources/application.properties`:
 | `server.port` | `8080` | Server listen port |
 | `app.data-dir` | `data` | Data directory for database and files |
 | `app.max-upload-size` | `104857600` | Max file upload size (100MB) |
+| `app.rate-limit.requests-per-minute` | `10` | Global leaky-bucket rate limit; excess requests get HTTP 429 |

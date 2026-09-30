@@ -2,10 +2,13 @@ package com.weavelab.interview.seed;
 
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
 @Component
 @ConditionalOnProperty(name = "app.seed", havingValue = "true")
+@Order(0) // run before StartupCheck (@Order(1)) so `--app.seed=true` seeds a fresh DB
+          // instead of StartupCheck's empty-DB System.exit(1) firing first
 public class SeedCommand implements CommandLineRunner {
 
     private final DataSeeder seeder;
